@@ -1,0 +1,6 @@
+out/
+builddir/
+
+compile_commands.json
+
+*.mid
