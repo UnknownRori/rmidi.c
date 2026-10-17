@@ -1,6 +1,6 @@
 # clean up source code into stb style library
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 100
 - TAGS: dev
 

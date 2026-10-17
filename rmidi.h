@@ -181,6 +181,10 @@ typedef struct Midi {
     MidiTrack* tracks;
 } Midi;
 
+#if defined(__cplusplus)
+extern "C" {  
+#endif
+
 bool midi_parse(Midi* midi, const uint8_t* buffer, size_t size);
 void midi_free(Midi* midi);
 
@@ -347,5 +351,9 @@ bool midi_parse(Midi* midi, const uint8_t* buffer, size_t size)
     return true;
 }
 #endif // RMIDI_IMPLEMENTATION
+
+#if defined(__cplusplus)
+}
+#endif
 
 #endif // RMIDI_H
