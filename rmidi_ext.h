@@ -83,12 +83,21 @@ typedef struct MidiPosition {
     uint8_t  denominator;
 } MidiPosition;
 
-double midi_tick_to_seconds   (const Midi* midi, const           MidiTempoMap*   map, uint32_t      tick);
-double midi_seconds_to_ticks  (const Midi* midi, const           MidiTempoMap*   map, double        seconds);
-void   midi_build_tempo_map   (const Midi* midi, MidiTempoMap*   map);
-void   midi_collect_notes     (const Midi* midi, const           MidiTempoMap*   map, MidiNoteList* notes);
-void   midi_build_timesig_map (const Midi* midi, MidiTimeSigMap* map);
-void   midi_ticks_to_position (const Midi* midi, const           MidiTimeSigMap* map, MidiPosition* pos, double tick);
+typedef struct MidiBar {
+    uint32_t start_tick;
+    uint32_t length_ticks;
+    uint32_t beat_ticks;
+    uint8_t  beats;
+} MidiBar;
+
+double midi_tick_to_seconds       (const Midi* midi, const           MidiTempoMap*   map, uint32_t      tick);
+double midi_seconds_to_ticks      (const Midi* midi, const           MidiTempoMap*   map, double        seconds);
+void   midi_build_tempo_map       (const Midi* midi, MidiTempoMap*   map);
+void   midi_collect_notes         (const Midi* midi, const           MidiTempoMap*   map, MidiNoteList* notes);
+void   midi_build_timesig_map     (const Midi* midi, MidiTimeSigMap* map);
+void   midi_ticks_to_position     (const Midi* midi, const           MidiTimeSigMap* map, MidiPosition* pos, double tick);
+void   midi_bar_at                (const Midi* midi, const           MidiTimeSigMap* map, MidiBar*      bar, double tick);
+const MidiTimeSig* midi_timesig_at(const MidiTimeSigMap* map, double tick);
 
 #if defined(RMIDI_EXT_IMPLEMENTATION)
 static int midi_tempo_cmp(const void* a, const void* b)
@@ -266,6 +275,18 @@ void midi_build_timesig_map(const Midi* midi, MidiTimeSigMap* map)
     }
 }
 
+const MidiTimeSig* midi_timesig_at(const MidiTimeSigMap* map, double tick)
+{
+    assert(map->count > 0);
+    size_t lo = 0, hi = map->count;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (map->items[mid].tick <= tick) lo = mid;
+        else                              hi = mid;
+    }
+    return &map->items[lo];
+}
+
 void midi_ticks_to_position(const Midi* midi, const MidiTimeSigMap* map, MidiPosition* pos, double tick)
 {
     assert(map->count > 0);
@@ -292,6 +313,19 @@ void midi_ticks_to_position(const Midi* midi, const MidiTimeSigMap* map, MidiPos
     pos->beat_fraction = (in_bar - beats * beat_ticks) / beat_ticks;
     pos->numerator     = ts->numerator;
     pos->denominator   = ts->denominator;
+}
+
+void midi_bar_at(const Midi* midi, const MidiTimeSigMap* map, MidiBar* bar, double tick)
+{
+    const MidiTimeSig* ts     = midi_timesig_at(map, tick);
+    if (tick < ts->tick) tick = ts->tick;
+    uint32_t bar_ticks        = midi_bar_ticks(midi, ts);
+    uint32_t bars             = (uint32_t)((tick - ts->tick) / bar_ticks);
+ 
+    bar->start_tick   = ts->tick + bars * bar_ticks;
+    bar->length_ticks = bar_ticks;
+    bar->beat_ticks   = midi_beat_ticks(midi, ts);
+    bar->beats        = ts->numerator;
 }
 #endif // RMIDI_EXT_IMPLEMENTATION
 #endif // RMIDI_EXT_H
