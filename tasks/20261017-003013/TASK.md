@@ -1,6 +1,6 @@
 # wrapper for parsed raw midi into more something that easy to work with
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 100
 - TAGS: dx
 

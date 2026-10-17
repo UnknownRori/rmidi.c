@@ -3,7 +3,8 @@
 #include <stdio.h>
 
 #define  RMIDI_IMPLEMENTATION
-#include "rmidi.h"
+#define  RMIDI_EXT_IMPLEMENTATION
+#include "rmidi_ext.h"
 
 uint8_t* load_file(const char* filename, size_t* out)
 {
