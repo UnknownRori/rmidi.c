@@ -1,6 +1,6 @@
 # fetching bpm on specific position
 
-- STATUS: OPEN
+- STATUS: CLOSED
 - PRIORITY: 100
 - TAGS:
 

@@ -90,6 +90,38 @@ typedef struct MidiBar {
     uint8_t  beats;
 } MidiBar;
 
+#define MIDI_TIME_END 1.0e18
+
+typedef enum MidiChordQuality {
+    MIDI_CHORD_NONE,
+    MIDI_CHORD_POWER,
+    MIDI_CHORD_MAJOR,
+    MIDI_CHORD_MINOR,
+    MIDI_CHORD_DIM,
+    MIDI_CHORD_AUG,
+    MIDI_CHORD_SUS2,
+    MIDI_CHORD_SUS4,
+    MIDI_CHORD_DOM7,
+    MIDI_CHORD_MAJ7,
+    MIDI_CHORD_MIN7,
+    MIDI_CHORD_DIM7,
+    MIDI_CHORD_HALF_DIM7,
+} MidiChordQuality;
+
+typedef struct MidiChord {
+    MidiChordQuality quality;
+    uint8_t          root;
+    uint8_t          bass;
+    uint8_t          notes;
+} MidiChord;
+
+typedef struct MidiKey {
+    uint8_t tonic;
+    uint8_t is_minor;
+    int8_t  sharps_flats;
+    double  confidence;
+} MidiKey;
+
 double midi_tick_to_seconds       (const Midi* midi, const           MidiTempoMap*   map, uint32_t      tick);
 double midi_seconds_to_ticks      (const Midi* midi, const           MidiTempoMap*   map, double        seconds);
 void   midi_build_tempo_map       (const Midi* midi, MidiTempoMap*   map);
@@ -98,8 +130,17 @@ void   midi_build_timesig_map     (const Midi* midi, MidiTimeSigMap* map);
 void   midi_ticks_to_position     (const Midi* midi, const           MidiTimeSigMap* map, MidiPosition* pos, double tick);
 void   midi_bar_at                (const Midi* midi, const           MidiTimeSigMap* map, MidiBar*      bar, double tick);
 const MidiTimeSig* midi_timesig_at(const MidiTimeSigMap* map, double tick);
+const MidiTempo*   midi_tempo_at          (const MidiTempoMap* map, double tick);
+double             midi_bpm_at            (const MidiTempoMap* map, double tick);
+bool               midi_detect_chord      (const MidiNoteList* notes, MidiChord* chord, int channel, double from, double to);
+bool               midi_detect_key        (const MidiNoteList* notes, MidiKey* key, int channel, double from, double to);
+const char*        midi_pitch_class_name  (uint8_t pc, bool flats);
+void               midi_chord_name        (const MidiChord* chord, bool flats, char* out, size_t cap);
+void               midi_key_name          (const MidiKey* key, char* out, size_t cap);
 
 #if defined(RMIDI_EXT_IMPLEMENTATION)
+#include <math.h>
+
 static int midi_tempo_cmp(const void* a, const void* b)
 {
     const MidiTempo* x = (const MidiTempo*)a;
@@ -326,6 +367,189 @@ void midi_bar_at(const Midi* midi, const MidiTimeSigMap* map, MidiBar* bar, doub
     bar->length_ticks = bar_ticks;
     bar->beat_ticks   = midi_beat_ticks(midi, ts);
     bar->beats        = ts->numerator;
+}
+
+const MidiTempo* midi_tempo_at(const MidiTempoMap* map, double tick)
+{
+    assert(map->count > 0);
+    size_t lo = 0, hi = map->count;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (map->items[mid].tick <= tick) lo = mid;
+        else                              hi = mid;
+    }
+    return &map->items[lo];
+}
+
+double midi_bpm_at(const MidiTempoMap* map, double tick)
+{
+    const MidiTempo* t = midi_tempo_at(map, tick);
+    return t->us_per_quarter ? 60000000.0 / t->us_per_quarter : 0.0;
+}
+
+static int midi_popcount(uint16_t v)
+{
+    int n = 0;
+    for (; v; v &= (uint16_t)(v - 1)) n++;
+    return n;
+}
+
+static const struct {
+    MidiChordQuality quality;
+    uint16_t         mask;
+} MIDI_CHORD_TEMPLATES[] = {
+    { MIDI_CHORD_POWER,     0x081 },
+    { MIDI_CHORD_MAJOR,     0x091 },
+    { MIDI_CHORD_MINOR,     0x089 },
+    { MIDI_CHORD_DIM,       0x049 },
+    { MIDI_CHORD_AUG,       0x111 },
+    { MIDI_CHORD_SUS2,      0x085 },
+    { MIDI_CHORD_SUS4,      0x0A1 },
+    { MIDI_CHORD_DOM7,      0x491 },
+    { MIDI_CHORD_MAJ7,      0x891 },
+    { MIDI_CHORD_MIN7,      0x489 },
+    { MIDI_CHORD_DIM7,      0x249 },
+    { MIDI_CHORD_HALF_DIM7, 0x449 },
+};
+
+static const char* const MIDI_CHORD_SUFFIX[] = {
+    [MIDI_CHORD_NONE]      = "",
+    [MIDI_CHORD_POWER]     = "5",
+    [MIDI_CHORD_MAJOR]     = "",
+    [MIDI_CHORD_MINOR]     = "m",
+    [MIDI_CHORD_DIM]       = "dim",
+    [MIDI_CHORD_AUG]       = "aug",
+    [MIDI_CHORD_SUS2]      = "sus2",
+    [MIDI_CHORD_SUS4]      = "sus4",
+    [MIDI_CHORD_DOM7]      = "7",
+    [MIDI_CHORD_MAJ7]      = "maj7",
+    [MIDI_CHORD_MIN7]      = "m7",
+    [MIDI_CHORD_DIM7]      = "dim7",
+    [MIDI_CHORD_HALF_DIM7] = "m7b5",
+};
+
+bool midi_detect_chord(const MidiNoteList* notes, MidiChord* chord, int channel, double from, double to)
+{
+    uint16_t mask = 0;
+    int      bass = 128;
+    for (size_t i = 0; i < notes->count; i++) {
+        const MidiNote* n = &notes->items[i];
+        if (n->start > to) break;
+        if (n->end <= from) continue;
+        if (channel < 0 ? n->channel == 9 : n->channel != channel) continue;
+        mask |= (uint16_t)(1u << (n->key % 12));
+        if (n->key < bass) bass = n->key;
+    }
+
+    memset(chord, 0, sizeof(*chord));
+    if (midi_popcount(mask) < 2) return false;
+    chord->bass  = (uint8_t)(bass % 12);
+    chord->notes = (uint8_t)midi_popcount(mask);
+
+    int best = -1000;
+    for (int root = 0; root < 12; root++) {
+        if (!(mask & (1u << root))) continue;
+        uint16_t rotated = (uint16_t)(((mask >> root) | (mask << (12 - root))) & 0x0FFF);
+        for (size_t t = 0; t < sizeof(MIDI_CHORD_TEMPLATES) / sizeof(MIDI_CHORD_TEMPLATES[0]); t++) {
+            uint16_t tpl = MIDI_CHORD_TEMPLATES[t].mask;
+            if (tpl & ~rotated) continue;
+            int score = midi_popcount(tpl) * 4
+                      - midi_popcount((uint16_t)(rotated & ~tpl)) * 3
+                      + (root == chord->bass ? 2 : 0);
+            if (score > best) {
+                best           = score;
+                chord->quality = MIDI_CHORD_TEMPLATES[t].quality;
+                chord->root    = (uint8_t)root;
+            }
+        }
+    }
+    return chord->quality != MIDI_CHORD_NONE;
+}
+
+static double midi_correlate(const double* x, const double* y)
+{
+    double mx = 0.0, my = 0.0;
+    for (int i = 0; i < 12; i++) { mx += x[i]; my += y[i]; }
+    mx /= 12.0;
+    my /= 12.0;
+
+    double sxy = 0.0, sxx = 0.0, syy = 0.0;
+    for (int i = 0; i < 12; i++) {
+        double dx = x[i] - mx;
+        double dy = y[i] - my;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    if (sxx <= 0.0 || syy <= 0.0) return -2.0;
+    return sxy / sqrt(sxx * syy);
+}
+
+bool midi_detect_key(const MidiNoteList* notes, MidiKey* key, int channel, double from, double to)
+{
+    static const double MAJOR[12] = { 6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88 };
+    static const double MINOR[12] = { 6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17 };
+    static const int8_t MAJOR_SIGNATURE[12] = { 0, -5, 2, -3, 4, -1, 6, 1, -4, 3, -2, 5 };
+
+    double histogram[12] = {0};
+    for (size_t i = 0; i < notes->count; i++) {
+        const MidiNote* n = &notes->items[i];
+        if (n->start >= to) break;
+        if (n->end <= from) continue;
+        if (channel < 0 ? n->channel == 9 : n->channel != channel) continue;
+        double a = n->start > from ? n->start : from;
+        double b = n->end   < to   ? n->end   : to;
+        if (b > a) histogram[n->key % 12] += b - a;
+    }
+
+    memset(key, 0, sizeof(*key));
+    double best  = -2.0;
+    bool   found = false;
+    for (int tonic = 0; tonic < 12; tonic++) {
+        for (int minor = 0; minor < 2; minor++) {
+            const double* profile = minor ? MINOR : MAJOR;
+            double rotated[12];
+            for (int pc = 0; pc < 12; pc++) rotated[pc] = profile[(pc - tonic + 12) % 12];
+            double r = midi_correlate(histogram, rotated);
+            if (r > best) {
+                best          = r;
+                key->tonic    = (uint8_t)tonic;
+                key->is_minor = (uint8_t)minor;
+                found         = true;
+            }
+        }
+    }
+    if (!found) return false;
+    key->confidence   = best;
+    key->sharps_flats = MAJOR_SIGNATURE[(key->tonic + (key->is_minor ? 3 : 0)) % 12];
+    return true;
+}
+
+const char* midi_pitch_class_name(uint8_t pc, bool flats)
+{
+    static const char* const SHARP[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+    static const char* const FLAT[12]  = { "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B" };
+    return (flats ? FLAT : SHARP)[pc % 12];
+}
+
+void midi_chord_name(const MidiChord* chord, bool flats, char* out, size_t cap)
+{
+    if (chord->quality == MIDI_CHORD_NONE) {
+        snprintf(out, cap, "N.C.");
+        return;
+    }
+    const char* root   = midi_pitch_class_name(chord->root, flats);
+    const char* suffix = MIDI_CHORD_SUFFIX[chord->quality];
+    if (chord->bass != chord->root)
+        snprintf(out, cap, "%s%s/%s", root, suffix, midi_pitch_class_name(chord->bass, flats));
+    else
+        snprintf(out, cap, "%s%s", root, suffix);
+}
+
+void midi_key_name(const MidiKey* key, char* out, size_t cap)
+{
+    snprintf(out, cap, "%s %s", midi_pitch_class_name(key->tonic, key->sharps_flats < 0),
+             key->is_minor ? "minor" : "major");
 }
 #endif // RMIDI_EXT_IMPLEMENTATION
 #endif // RMIDI_EXT_H
