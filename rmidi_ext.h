@@ -45,6 +45,7 @@ See LICENSE file in repository root for full terms.
 #define RMIDI_EXT_H
 
 #include "rmidi.h"
+#include <math.h>
 
 typedef struct MidiTempo {
     uint32_t tick;
@@ -122,6 +123,15 @@ typedef struct MidiKey {
     double  confidence;
 } MidiKey;
 
+typedef struct MidiKeySig {
+    uint32_t tick;
+    int8_t   sharps_flats;
+    uint8_t  is_minor;
+    size_t   order;
+} MidiKeySig;
+
+da_decl(MidiKeySig, MidiKeySigMap)
+
 double midi_tick_to_seconds       (const Midi* midi, const           MidiTempoMap*   map, uint32_t      tick);
 double midi_seconds_to_ticks      (const Midi* midi, const           MidiTempoMap*   map, double        seconds);
 void   midi_build_tempo_map       (const Midi* midi, MidiTempoMap*   map);
@@ -137,10 +147,11 @@ bool               midi_detect_key        (const MidiNoteList* notes, MidiKey* k
 const char*        midi_pitch_class_name  (uint8_t pc, bool flats);
 void               midi_chord_name        (const MidiChord* chord, bool flats, char* out, size_t cap);
 void               midi_key_name          (const MidiKey* key, char* out, size_t cap);
+void               midi_chord_roman       (const MidiChord* chord, const MidiKey* key, char* out, size_t cap);
+void               midi_build_keysig_map  (const Midi* midi, MidiKeySigMap* map);
+bool               midi_keysig_at         (const MidiKeySigMap* map, MidiKey* key, double tick);
 
 #if defined(RMIDI_EXT_IMPLEMENTATION)
-#include <math.h>
-
 static int midi_tempo_cmp(const void* a, const void* b)
 {
     const MidiTempo* x = (const MidiTempo*)a;
@@ -550,6 +561,94 @@ void midi_key_name(const MidiKey* key, char* out, size_t cap)
 {
     snprintf(out, cap, "%s %s", midi_pitch_class_name(key->tonic, key->sharps_flats < 0),
              key->is_minor ? "minor" : "major");
+}
+
+void midi_chord_roman(const MidiChord* chord, const MidiKey* key, char* out, size_t cap)
+{
+    static const char* const MAJOR_NUMERAL[12] = { "I", "bII", "II", "bIII", "III", "IV", "#IV", "V", "bVI", "VI", "bVII", "VII" };
+    static const char* const MINOR_NUMERAL[12] = { "I", "bII", "II", "III", "#III", "IV", "#IV", "V", "VI", "#VI", "VII", "#VII" };
+    static const struct {
+        bool        lower;
+        const char* suffix;
+    } STYLE[] = {
+        [MIDI_CHORD_NONE]      = { false, ""     },
+        [MIDI_CHORD_POWER]     = { false, "5"    },
+        [MIDI_CHORD_MAJOR]     = { false, ""     },
+        [MIDI_CHORD_MINOR]     = { true,  ""     },
+        [MIDI_CHORD_DIM]       = { true,  "°"    },
+        [MIDI_CHORD_AUG]       = { false, "+"    },
+        [MIDI_CHORD_SUS2]      = { false, "sus2" },
+        [MIDI_CHORD_SUS4]      = { false, "sus4" },
+        [MIDI_CHORD_DOM7]      = { false, "7"    },
+        [MIDI_CHORD_MAJ7]      = { false, "maj7" },
+        [MIDI_CHORD_MIN7]      = { true,  "7"    },
+        [MIDI_CHORD_DIM7]      = { true,  "°7"   },
+        [MIDI_CHORD_HALF_DIM7] = { true,  "ø7"   },
+    };
+
+    if (chord->quality == MIDI_CHORD_NONE) {
+        snprintf(out, cap, "-");
+        return;
+    }
+    int  offset = (chord->root - key->tonic + 12) % 12;
+    char numeral[8];
+    snprintf(numeral, sizeof numeral, "%s", (key->is_minor ? MINOR_NUMERAL : MAJOR_NUMERAL)[offset]);
+    if (STYLE[chord->quality].lower)
+        for (char* c = numeral; *c; c++)
+            if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + ('a' - 'A'));
+    snprintf(out, cap, "%s%s", numeral, STYLE[chord->quality].suffix);
+}
+
+static int midi_keysig_cmp(const void* a, const void* b)
+{
+    const MidiKeySig* x = (const MidiKeySig*)a;
+    const MidiKeySig* y = (const MidiKeySig*)b;
+    if (x->tick != y->tick) return x->tick < y->tick ? -1 : 1;
+    return x->order < y->order ? -1 : (x->order > y->order);
+}
+
+void midi_build_keysig_map(const Midi* midi, MidiKeySigMap* map)
+{
+    da_reset(map);
+    size_t order = 0;
+    for (uint16_t i = 0; i < midi->ntracks; i++) {
+        da_foreach(MidiEvent, ev, &midi->tracks[i]) {
+            if (ev->kind != MIDI_EVENT_META || ev->as.meta.kind != MIDI_META_KEY_SIG) continue;
+            int8_t sharps_flats = ev->as.meta.as.key_signature.sharps_flats;
+            if (sharps_flats < -7 || sharps_flats > 7) continue;
+            MidiKeySig ks = { ev->tick, sharps_flats, ev->as.meta.as.key_signature.is_minor, order++ };
+            da_append(map, ks);
+        }
+    }
+    if (map->count > 1) qsort(map->items, map->count, sizeof(MidiKeySig), midi_keysig_cmp);
+
+    size_t n = 0;
+    for (size_t i = 0; i < map->count; i++) {
+        if (n > 0 && map->items[n - 1].tick == map->items[i].tick)
+            map->items[n - 1] = map->items[i];
+        else
+            map->items[n++]   = map->items[i];
+    }
+    map->count = n;
+}
+
+bool midi_keysig_at(const MidiKeySigMap* map, MidiKey* key, double tick)
+{
+    memset(key, 0, sizeof(*key));
+    if (map->count == 0) return false;
+    size_t lo = 0, hi = map->count;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (map->items[mid].tick <= tick) lo = mid;
+        else                              hi = mid;
+    }
+    const MidiKeySig* ks = &map->items[lo];
+    int major = ((ks->sharps_flats * 7) % 12 + 12) % 12;
+    key->tonic        = (uint8_t)(ks->is_minor ? (major + 9) % 12 : major);
+    key->is_minor     = ks->is_minor;
+    key->sharps_flats = ks->sharps_flats;
+    key->confidence   = 1.0;
+    return true;
 }
 #endif // RMIDI_EXT_IMPLEMENTATION
 #endif // RMIDI_EXT_H
