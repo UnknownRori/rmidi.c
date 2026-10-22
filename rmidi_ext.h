@@ -116,6 +116,11 @@ typedef struct MidiChord {
     uint8_t          notes;
 } MidiChord;
 
+typedef struct MidiChordTone {
+    char        name[4];
+    const char* degree;
+} MidiChordTone;
+
 typedef struct MidiKey {
     uint8_t tonic;
     uint8_t is_minor;
@@ -150,6 +155,7 @@ void               midi_key_name          (const MidiKey* key, char* out, size_t
 void               midi_chord_roman       (const MidiChord* chord, const MidiKey* key, char* out, size_t cap);
 void               midi_build_keysig_map  (const Midi* midi, MidiKeySigMap* map);
 bool               midi_keysig_at         (const MidiKeySigMap* map, MidiKey* key, double tick);
+int                midi_chord_tones       (const MidiChord* chord, bool flats, MidiChordTone* out, int cap);
 
 #if defined(RMIDI_EXT_IMPLEMENTATION)
 static int midi_tempo_cmp(const void* a, const void* b)
@@ -559,8 +565,30 @@ void midi_chord_name(const MidiChord* chord, bool flats, char* out, size_t cap)
 
 void midi_key_name(const MidiKey* key, char* out, size_t cap)
 {
-    snprintf(out, cap, "%s %s", midi_pitch_class_name(key->tonic, key->sharps_flats < 0),
-             key->is_minor ? "minor" : "major");
+    static const char* const KEY_NAMES[15][2] = {
+        { "Cb", "Ab" },
+        { "Gb", "Eb" },
+        { "Db", "Bb" },
+        { "Ab", "F"  },
+        { "Eb", "C"  },
+        { "Bb", "G"  },
+        { "F",  "D"  },
+        { "C",  "A"  },
+        { "G",  "E"  },
+        { "D",  "B"  },
+        { "A",  "F#" },
+        { "E",  "C#" },
+        { "B",  "G#" },
+        { "F#", "D#" },
+        { "C#", "A#" } 
+    };
+    int idx = key->sharps_flats + 7;
+    if (idx < 0) idx = 0;
+    if (idx > 14) idx = 14;
+
+    bool minor = key->is_minor; // Can be your forced true value
+
+    snprintf(out, cap, "%s %s", KEY_NAMES[idx][minor ? 1 : 0], minor ? "min" : "maj");
 }
 
 void midi_chord_roman(const MidiChord* chord, const MidiKey* key, char* out, size_t cap)
@@ -649,6 +677,40 @@ bool midi_keysig_at(const MidiKeySigMap* map, MidiKey* key, double tick)
     key->sharps_flats = ks->sharps_flats;
     key->confidence   = 1.0;
     return true;
+}
+
+static const char* const MIDI_INTERVAL_DEGREE[12] = { "R", "b2", "2", "b3", "3", "4", "b5", "5", "#5", "bb7", "b7", "7" };
+static const int         MIDI_INTERVAL_STEP[12]   = { 0, 1, 1, 2, 2, 3, 4, 4, 4, 6, 6, 6 };
+
+int midi_chord_tones(const MidiChord* chord, bool flats, MidiChordTone* out, int cap)
+{
+    static const char LETTERS[7] = { 'C', 'D', 'E', 'F', 'G', 'A', 'B' };
+    static const int  NATURAL[7] = { 0, 2, 4, 5, 7, 9, 11 };
+
+    if (chord->quality == MIDI_CHORD_NONE) return 0;
+    uint16_t mask = 0;
+    for (size_t t = 0; t < sizeof(MIDI_CHORD_TEMPLATES) / sizeof(MIDI_CHORD_TEMPLATES[0]); t++)
+        if (MIDI_CHORD_TEMPLATES[t].quality == chord->quality) mask = MIDI_CHORD_TEMPLATES[t].mask;
+    if (mask == 0) return 0;
+
+    const char* root_name   = midi_pitch_class_name(chord->root, flats);
+    int         root_letter = 0;
+    for (int i = 0; i < 7; i++)
+        if (LETTERS[i] == root_name[0]) root_letter = i;
+
+    int n = 0;
+    for (int semitones = 0; semitones < 12 && n < cap; semitones++) {
+        if (!(mask & (1u << semitones))) continue;
+        int         letter = (root_letter + MIDI_INTERVAL_STEP[semitones]) % 7;
+        int         pc     = (chord->root + semitones) % 12;
+        int         diff   = (pc - NATURAL[letter] + 12) % 12;
+        const char* accidental = diff == 0 ? "" : diff == 1 ? "#" : diff == 2 ? "##" : diff == 11 ? "b" : diff == 10 ? "bb" : NULL;
+        if (accidental) snprintf(out[n].name, sizeof out[n].name, "%c%s", LETTERS[letter], accidental);
+        else            snprintf(out[n].name, sizeof out[n].name, "%s", midi_pitch_class_name((uint8_t)pc, flats));
+        out[n].degree = MIDI_INTERVAL_DEGREE[semitones];
+        n++;
+    }
+    return n;
 }
 #endif // RMIDI_EXT_IMPLEMENTATION
 #endif // RMIDI_EXT_H
